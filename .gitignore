@@ -1,0 +1,3 @@
+/vendor/
+config/simple-cache.php
+composer.lock
