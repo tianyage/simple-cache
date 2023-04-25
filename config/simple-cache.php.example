@@ -1,0 +1,10 @@
+<?php
+
+return [
+    // 主机
+    'hostname' => '',
+    // 密码
+    'password' => '',
+    // 端口
+    'port'     => 6379,
+];

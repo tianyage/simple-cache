@@ -72,7 +72,16 @@ class Cache
         return $keyArr;
     }
     
-    public static function delMutil(string $key, int $db = null)
+    /**
+     * 批量删除（pip管道模式）
+     *
+     * @param string   $key 支持模糊搜索[*] exp: test1_*
+     * @param int|null $db  [可选] 切换db
+     *
+     * @return true
+     * @throws RedisException
+     */
+    public static function delMutil(string $key, int $db = null): bool
     {
         if (!is_null($db)) {
             self::$redis->select($db);
@@ -98,8 +107,18 @@ class Cache
      */
     private static function getConfig(string $name = '', array|string $default = ''): array|string
     {
-        $ds     = DIRECTORY_SEPARATOR; // 目录分隔符 /或\
-        $config = require_once dirname(__DIR__) . "{$ds}config{$ds}simple-cache.php";
+        static $config = null;
+        if (!$config) {
+            $lib_path    = realpath(dirname(__DIR__)) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\vendor\tianyage\simple-cache\
+            $root_path   = dirname($lib_path, 3) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\
+            $config_path = "{$root_path}config" . DIRECTORY_SEPARATOR . "simple-cache.php";
+            try {
+                $config = require_once $config_path;
+            } catch (Throwable $e) {
+                echo "文件打开失败：{$config_path}";
+                die;
+            }
+        }
         // 无参数时获取所有
         if (empty($name)) {
             return $config;
