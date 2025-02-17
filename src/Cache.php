@@ -10,28 +10,8 @@ use Throwable;
 class Cache
 {
     
-    private static array $instances = [];
-    
-    //    public static function getInstance(int $index): Redis
-    //    {
-    //        if (empty(self::$redis)) {
-    //            $config = self::getConfig();
-    //            try {
-    //                self::$redis = new Redis();
-    //                self::$redis->connect($config['hostname'], $config['port']);
-    //                self::$redis->auth($config['password']); //设置密码
-    //            } catch (Exception $e) {
-    //                echo '链接redis失败:' . $e->getMessage();
-    //                throw $e;
-    //            }
-    //        }
-    //        // 切换db时做判断是否一致
-    //        if ($index !== self::$db_index) {
-    //            self::$redis->select($index);
-    //            self::$db_index = $index;
-    //        }
-    //        return self::$redis;
-    //    }
+    private static array $instances        = [];
+    private static array $connectionStatus = []; // 记录最后一次检查时间
     
     /**
      * redis单例
@@ -39,18 +19,30 @@ class Cache
      * @param int $index 数据库编号
      *
      * @return Redis
-     * @throws
+     * @throws RedisException
      */
     public static function getInstance(int $index): Redis
     {
-        // 检查当前实例是否存在
-        if (!isset(self::$instances[$index])) {
-            self::createRedisInstance($index);
-        }
-        
-        // 检查Redis连接是否仍然有效
-        if (!self::$instances[$index]->ping()) {
-            self::reconnectRedis($index);
+        try {
+            // 检查当前实例是否存在
+            if (!isset(self::$instances[$index])) {
+                self::createRedisInstance($index);
+                self::$connectionStatus[$index] = time(); // 更新检查时间
+            } else {
+                // 每隔N秒检查一次连接状态
+                if (time() - self::$connectionStatus[$index] > 5) {
+                    // 显式检查连接状态（捕获ping的异常）
+                    try {
+                        self::$instances[$index]->ping();
+                    } catch (RedisException $e) {
+                        self::reconnectRedis($index);
+                    }
+                    
+                    self::$connectionStatus[$index] = time(); // 更新检查时间
+                }
+            }
+        } catch (RedisException $e) {
+            throw new RedisException("getInstance失败: " . $e->getMessage());
         }
         
         return self::$instances[$index];
@@ -69,13 +61,18 @@ class Cache
         $config = self::getConfig();
         try {
             $redis = new Redis();
-            $redis->connect($config['hostname'], $config['port']);
+            $redis->connect(
+                $config['hostname'],
+                $config['port'],
+                5,    // 超时时间（秒）
+                null,
+                300,  // 重试间隔（毫秒）
+            );
             $redis->auth($config['password']);
             $redis->select($index);  // 选择对应的数据库
             self::$instances[$index] = $redis;
         } catch (Exception $e) {
-            echo '连接redis失败: ' . $e->getMessage();
-            throw $e;
+            throw new RedisException("createRedisInstance失败: " . $e->getMessage());
         }
     }
     
@@ -90,13 +87,18 @@ class Cache
     private static function reconnectRedis(int $index): void
     {
         try {
-            //            echo "检测到 Redis 连接断开，尝试重连...\n";
-            self::$instances[$index]->close(); // 先关闭原来的连接
-            self::createRedisInstance($index); // 重新创建实例
-            //            echo "Redis 重连成功\n";
+            // 移除旧实例（会自动触发连接关闭 ->close() ）
+            if (isset(self::$instances[$index])) {
+                unset(self::$instances[$index]);
+            }
+            // 重新创建连接
+            self::createRedisInstance($index);
         } catch (Exception $e) {
-            echo 'Redis 重连失败: ' . $e->getMessage();
-            throw $e;
+            // 确保实例被清理
+            if (isset(self::$instances[$index])) {
+                unset(self::$instances[$index]);
+            }
+            throw new RedisException("reconnectRedis失败: " . $e->getMessage());
         }
     }
     
@@ -118,8 +120,7 @@ class Cache
             try {
                 $config = require $config_path;
             } catch (Throwable $e) {
-                echo "文件打开失败：{$config_path}";
-                die;
+                throw new RedisException("{$config_path}加载失败:{$e->getMessage()}");
             }
         }
         // 无参数时获取所有
@@ -153,16 +154,22 @@ class Cache
      * @param string $pattern 要匹配的规则  'test_*'
      * @param int    $db      数据库号 默认0
      * @param int    $count   每次遍历数量 count越大总耗时越短，但单次阻塞越长。 建议5000-10000。并发不高则可以调至接近1w。
+     * @param int    $timeout
      *
      * @return array
-     * @throws RedisException
      */
-    public static function redisScan(string $pattern, int $db, int $count = 5000): array
+    public static function redisScan(string $pattern, int $db, int $count = 5000, int $timeout = 30): array
     {
-        $redis = self::getInstance($db);
+        $redis     = self::getInstance($db);
+        $keyArr    = [];
+        $startTime = time();
         
-        $keyArr = [];
         while (true) {
+            // 检查是否超时
+            if ((time() - $startTime) > $timeout) {
+                throw new RedisException("redisScan超时{$timeout}秒");
+            }
+            
             // $iterator 下条数据的坐标
             $data   = $redis->scan($iterator, $pattern, $count);
             $keyArr = array_merge($keyArr, $data ?: []);
@@ -188,17 +195,20 @@ class Cache
      * @return true
      * @throws RedisException
      */
-    public static function delMutil(string $key, int $db): bool
+    public static function delMutil(string $key, int $db, int $batchSize = 1000): bool
     {
         $redis = self::getInstance($db);
+        $keys  = self::redisScan($key, $db); // 模糊扫描查找
         
-        $keys = self::redisScan($key, $db); // 模糊扫描查找
         if (count($keys) > 0) {
             $pipe = $redis->multi($redis::PIPELINE);  // 开启管道模式，代表将操作命令暂时放在管道里
-            foreach ($keys as $key) {
-                $pipe->del($key);
+            // 分批执行（限制每次删除的键数量，避免一次性删除过多数据导致性能异常）
+            foreach (array_chunk($keys, $batchSize) as $chunk) {
+                foreach ($chunk as $key) {
+                    $pipe->del($key);
+                }
+                $pipe->exec(); // 开始执行管道里所有命令
             }
-            $pipe->exec(); // 开始执行管道里所有命令
         }
         return true;
     }
