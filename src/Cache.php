@@ -13,6 +13,7 @@ class Cache
 {
     private static array $instances        = [];
     private static array $connectionStatus = []; // 记录最后一次检查时间
+    private static array $configs          = [];
     
     /**
      * redis单例
@@ -115,8 +116,7 @@ class Cache
      */
     private static function getConfig(string $name = '', array|string $default = '', string $store = 'default'): array|string
     {
-        static $config = null;
-        if (!$config) {
+        if (empty(self::$configs[$store])) {
             // 判断root_path 网站根目录函数是否定义
             if (!function_exists('root_path')) {
                 $lib_path    = realpath(dirname(__DIR__)) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\vendor\tianyage\simple-cache\
@@ -127,30 +127,32 @@ class Cache
             }
             
             try {
-                $config = require $config_path;
+                self::$configs = require $config_path;
                 // 选择数据库
-                if (!empty($config[$store])) {
-                    $config = $config[$store];
-                } else {
+                if (empty(self::$configs[$store])) {
                     throw new RedisException("数据库{$store}不存在");
                 }
+                $config = self::$configs[$store];
             } catch (Throwable $e) {
                 throw new RedisException("{$config_path}加载失败:{$e->getMessage()}");
             }
+        } else {
+            $config = self::$configs[$store];
         }
+        
         // 无参数时获取所有
         if (empty($name)) {
             return $config;
         }
         
+        // 获取单级配置
         if (!str_contains($name, '.')) {
             return $config[$name] ?? [];
         }
         
+        // 获取二级配置
         $name    = explode('.', $name);
-        $name[0] = strtolower($name[0]);
-        //        $config  = self::$config;
-        
+        $name[0] = strtolower($name[0]); // 转小写
         // 按.拆分成多维数组进行判断
         foreach ($name as $val) {
             if (isset($config[$val])) {
