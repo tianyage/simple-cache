@@ -11,40 +11,38 @@ use Throwable;
 
 class Cache
 {
-    private static array $instances        = [];
-    private static array $connectionStatus = []; // 记录最后一次检查时间
-    private static array $configs          = [];
+    private static array $instances     = [];
+    private static array $lastCheckTime = []; // 记录最后一次检查时间
+    private static array $configs       = [];
+    
+    private const DEFAULT_STORE = 'default';
+    private const PING_INTERVAL = 5;
     
     /**
-     * redis单例
+     * 获取 Redis 单例
      *
      * @param int    $index 数据库编号
-     * @param string $store 选择连接信息
+     * @param string $store 配置名称
      *
      * @return Redis
      */
-    public static function getInstance(int $index, string $store = 'default'): Redis
+    public static function getInstance(int $index, string $store = self::DEFAULT_STORE): Redis
     {
-        try {
-            // 检查当前实例是否存在
-            if (!isset(self::$instances[$store][$index])) {
-                self::createRedisInstance($index, $store);
-                self::$connectionStatus[$store][$index] = time(); // 更新检查时间
-            } else {
-                // 每隔N秒检查一次连接状态
-                if (time() - self::$connectionStatus[$store][$index] > 5) {
-                    // 显式检查连接状态（捕获ping的异常）
-                    try {
-                        self::$instances[$store][$index]->ping();
-                    } catch (RedisException) {
-                        self::reconnectRedis($index, $store);
-                    }
-                    
-                    self::$connectionStatus[$store][$index] = time(); // 更新检查时间
-                }
+        if (!isset(self::$instances[$store][$index])) {
+            return self::createInstance($index, $store);
+        }
+        
+        // 每隔N秒检查一次连接状态
+        $lastChecked = self::$lastCheckTime[$store][$index] ?? 0;
+        if (time() - $lastChecked > self::PING_INTERVAL) {
+            // 显式检查连接状态（捕获ping的异常）
+            try {
+                self::$instances[$store][$index]->ping();
+            } catch (RedisException) {
+                return self::reconnect($index, $store);
+            } finally {
+                self::$lastCheckTime[$store][$index] = time(); // 更新检查时间
             }
-        } catch (RedisException $e) {
-            throw new RedisException("getInstance失败: " . $e->getMessage());
         }
         
         return self::$instances[$store][$index];
@@ -56,25 +54,32 @@ class Cache
      * @param int    $index
      * @param string $store
      *
-     * @return void
+     * @return Redis
      */
-    private static function createRedisInstance(int $index, string $store): void
+    private static function createInstance(int $index, string $store): Redis
     {
-        $config = self::getConfig(store: $store);
+        $config = self::loadConfig($store);
+        
         try {
             $redis = new Redis();
             $redis->connect(
-                $config['hostname'],
-                $config['port'],
-                5,    // 超时时间（秒）
+                $config['hostname'] ?? '127.0.0.1',
+                $config['port'] ?? 6379,
+                5, // 超时时间（秒）
                 null,
-                300,  // 重试间隔（毫秒）
+                300 // 重试间隔（毫秒）
             );
-            $redis->auth($config['password']);
-            $redis->select($index);  // 选择对应的数据库
-            self::$instances[$store][$index] = $redis;
+            
+            if (!empty($config['password'])) {
+                $redis->auth($config['password']);
+            }
+            $redis->select($index); // 选择对应的数据库
+            self::$instances[$store][$index]     = $redis;
+            self::$lastCheckTime[$store][$index] = time();
+            
+            return $redis;
         } catch (Exception $e) {
-            throw new RedisException("createRedisInstance失败: " . $e->getMessage());
+            throw new RedisException("连接 Redis 失败: " . $e->getMessage());
         }
     }
     
@@ -84,86 +89,102 @@ class Cache
      * @param int    $index
      * @param string $store
      *
-     * @return void
+     * @return Redis
      */
-    private static function reconnectRedis(int $index, string $store): void
+    private static function reconnect(int $index, string $store): Redis
     {
+        // 移除旧实例（会自动触发连接关闭 ->close() ）
+        unset(self::$instances[$store][$index]);
+        
         try {
-            // 移除旧实例（会自动触发连接关闭 ->close() ）
-            if (isset(self::$instances[$store][$index])) {
-                unset(self::$instances[$store][$index]);
-            }
             // 重新创建连接
-            self::createRedisInstance($index, $store);
+            return self::createInstance($index, $store);
         } catch (Exception $e) {
             // 确保实例被清理
             if (isset(self::$instances[$store][$index])) {
                 unset(self::$instances[$store][$index]);
             }
-            throw new RedisException("reconnectRedis失败: " . $e->getMessage());
+            throw new RedisException("Redis 重连失败: " . $e->getMessage());
         }
     }
     
     /**
-     * 获取配置
+     * 加载配置
      *
-     * @param string       $name
-     * @param array|string $default
-     * @param string       $store
+     * @param string $store
      *
-     * @return array|string
-     * @noinspection PhpSameParameterValueInspection
+     * @return array
      */
-    private static function getConfig(string $name = '', array|string $default = '', string $store = 'default'): array|string
+    private static function loadConfig(string $store = self::DEFAULT_STORE): array
     {
         if (empty(self::$configs[$store])) {
-            // 判断root_path 网站根目录函数是否定义
-            if (!function_exists('root_path')) {
-                $lib_path    = realpath(dirname(__DIR__)) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\vendor\tianyage\simple-cache\
-                $root_path   = dirname($lib_path, 3) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\
-                $config_path = "{$root_path}config" . DIRECTORY_SEPARATOR . "simple-cache.php";
-            } else {
-                $config_path = root_path() . 'config/simple-cache.php';
-            }
+            $configPath = self::resolveConfigPath();
             
             try {
-                self::$configs = require $config_path;
-                // 选择数据库
+                self::$configs = require $configPath;
+                
+                // 选择指定配置
                 if (empty(self::$configs[$store])) {
-                    throw new RedisException("数据库{$store}不存在");
+                    throw new RedisException("Redis配置'{$store}'不存在");
                 }
-                $config = self::$configs[$store];
             } catch (Throwable $e) {
-                throw new RedisException("{$config_path}加载失败:{$e->getMessage()}");
+                throw new RedisException("加载Redis配置失败({$configPath}): " . $e->getMessage());
             }
-        } else {
-            $config = self::$configs[$store];
         }
         
+        return self::$configs[$store];
+    }
+    
+    /**
+     * 解析配置路径
+     *
+     * @return string
+     */
+    private static function resolveConfigPath(): string
+    {
+        if (function_exists('root_path')) {
+            return root_path() . 'config/simple-cache.php';
+        }
+        
+        $vendorDir   = realpath(dirname(__DIR__));
+        $projectRoot = dirname($vendorDir, 3);
+        $configPath  = $projectRoot . DIRECTORY_SEPARATOR . 'config' . DIRECTORY_SEPARATOR . 'simple-cache.php';
+        
+        if (file_exists($configPath)) {
+            return $configPath;
+        }
+        throw new RedisException("Redis配置文件不存在: {$configPath}");
+    }
+    
+    /**
+     * 获取某项配置
+     */
+    public static function config(string $key = '', array|string $default = '', string $store = self::DEFAULT_STORE): array|string
+    {
+        $config = self::loadConfig($store);
+        
         // 无参数时获取所有
-        if (empty($name)) {
+        if ($key === '') {
             return $config;
         }
         
         // 获取单级配置
-        if (!str_contains($name, '.')) {
-            return $config[$name] ?? [];
+        if (!str_contains($key, '.')) {
+            return $config[$key] ?? $default;
         }
         
         // 获取二级配置
-        $name    = explode('.', $name);
-        $name[0] = strtolower($name[0]); // 转小写
-        // 按.拆分成多维数组进行判断
-        foreach ($name as $val) {
-            if (isset($config[$val])) {
-                $config = $config[$val];
-            } else {
+        $parts = explode('.', $key);  // 按.拆分成多维数组进行判断
+        foreach ($parts as $part) {
+            if (!is_array($config) || !array_key_exists($part, $config)) {
                 return $default;
             }
+            $config = $config[$part];
         }
         
         return $config;
     }
+    
     
     /**
      * 模糊查找redis key
