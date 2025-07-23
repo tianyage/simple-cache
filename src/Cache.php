@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Tianyage\SimpleCache;
 
 use Exception;
@@ -9,56 +11,55 @@ use Throwable;
 
 class Cache
 {
-    
     private static array $instances        = [];
     private static array $connectionStatus = []; // 记录最后一次检查时间
     
     /**
      * redis单例
      *
-     * @param int $index 数据库编号
+     * @param int    $index 数据库编号
+     * @param string $store 选择连接信息
      *
      * @return Redis
-     * @throws RedisException
      */
-    public static function getInstance(int $index): Redis
+    public static function getInstance(int $index, string $store = 'default'): Redis
     {
         try {
             // 检查当前实例是否存在
-            if (!isset(self::$instances[$index])) {
-                self::createRedisInstance($index);
-                self::$connectionStatus[$index] = time(); // 更新检查时间
+            if (!isset(self::$instances[$store][$index])) {
+                self::createRedisInstance($index, $store);
+                self::$connectionStatus[$store][$index] = time(); // 更新检查时间
             } else {
                 // 每隔N秒检查一次连接状态
-                if (time() - self::$connectionStatus[$index] > 5) {
+                if (time() - self::$connectionStatus[$store][$index] > 5) {
                     // 显式检查连接状态（捕获ping的异常）
                     try {
-                        self::$instances[$index]->ping();
-                    } catch (RedisException $e) {
-                        self::reconnectRedis($index);
+                        self::$instances[$store][$index]->ping();
+                    } catch (RedisException) {
+                        self::reconnectRedis($index, $store);
                     }
                     
-                    self::$connectionStatus[$index] = time(); // 更新检查时间
+                    self::$connectionStatus[$store][$index] = time(); // 更新检查时间
                 }
             }
         } catch (RedisException $e) {
             throw new RedisException("getInstance失败: " . $e->getMessage());
         }
         
-        return self::$instances[$index];
+        return self::$instances[$store][$index];
     }
     
     /**
      * 创建新的 Redis 实例
      *
-     * @param int $index
+     * @param int    $index
+     * @param string $store
      *
      * @return void
-     * @throws RedisException
      */
-    private static function createRedisInstance(int $index): void
+    private static function createRedisInstance(int $index, string $store): void
     {
-        $config = self::getConfig();
+        $config = self::getConfig(store: $store);
         try {
             $redis = new Redis();
             $redis->connect(
@@ -70,7 +71,7 @@ class Cache
             );
             $redis->auth($config['password']);
             $redis->select($index);  // 选择对应的数据库
-            self::$instances[$index] = $redis;
+            self::$instances[$store][$index] = $redis;
         } catch (Exception $e) {
             throw new RedisException("createRedisInstance失败: " . $e->getMessage());
         }
@@ -79,24 +80,24 @@ class Cache
     /**
      * 重连 Redis 实例
      *
-     * @param int $index
+     * @param int    $index
+     * @param string $store
      *
      * @return void
-     * @throws RedisException
      */
-    private static function reconnectRedis(int $index): void
+    private static function reconnectRedis(int $index, string $store): void
     {
         try {
             // 移除旧实例（会自动触发连接关闭 ->close() ）
-            if (isset(self::$instances[$index])) {
-                unset(self::$instances[$index]);
+            if (isset(self::$instances[$store][$index])) {
+                unset(self::$instances[$store][$index]);
             }
             // 重新创建连接
-            self::createRedisInstance($index);
+            self::createRedisInstance($index, $store);
         } catch (Exception $e) {
             // 确保实例被清理
-            if (isset(self::$instances[$index])) {
-                unset(self::$instances[$index]);
+            if (isset(self::$instances[$store][$index])) {
+                unset(self::$instances[$store][$index]);
             }
             throw new RedisException("reconnectRedis失败: " . $e->getMessage());
         }
@@ -107,18 +108,32 @@ class Cache
      *
      * @param string       $name
      * @param array|string $default
+     * @param string       $store
      *
      * @return array|string
+     * @noinspection PhpSameParameterValueInspection
      */
-    private static function getConfig(string $name = '', array|string $default = ''): array|string
+    private static function getConfig(string $name = '', array|string $default = '', string $store = 'default'): array|string
     {
         static $config = null;
         if (!$config) {
-            $lib_path    = realpath(dirname(__DIR__)) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\vendor\tianyage\simple-cache\
-            $root_path   = dirname($lib_path, 3) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\
-            $config_path = "{$root_path}config" . DIRECTORY_SEPARATOR . "simple-cache.php";
+            // 判断root_path 网站根目录函数是否定义
+            if (!function_exists('root_path')) {
+                $lib_path    = realpath(dirname(__DIR__)) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\vendor\tianyage\simple-cache\
+                $root_path   = dirname($lib_path, 3) . DIRECTORY_SEPARATOR; // D:\WorkSpace\Git\qq-utils\
+                $config_path = "{$root_path}config" . DIRECTORY_SEPARATOR . "simple-cache.php";
+            } else {
+                $config_path = root_path() . 'config/simple-cache.php';
+            }
+            
             try {
                 $config = require $config_path;
+                // 选择数据库
+                if (!empty($config[$store])) {
+                    $config = $config[$store];
+                } else {
+                    throw new RedisException("数据库{$store}不存在");
+                }
             } catch (Throwable $e) {
                 throw new RedisException("{$config_path}加载失败:{$e->getMessage()}");
             }
@@ -174,12 +189,18 @@ class Cache
             $data   = $redis->scan($iterator, $pattern, $count);
             $keyArr = array_merge($keyArr, $data ?: []);
             
-            if ($iterator === 0) {   //迭代结束，未找到匹配
+            // 迭代结束，未找到匹配
+            if ($iterator === 0 || $iterator === '0') { //（兼容字符串 "0" 和整数 0）
                 break;
             }
-            if ($iterator === null) { //"游标为null了，重置为0，继续扫描"
-                $iterator = "0";
+            
+            // 异常处理
+            if ($iterator === null) {
+                throw new RedisException("Redis SCAN iterator is null");
             }
+            //            if ($iterator === null) { //"游标为null了，重置为0，继续扫描"
+            //                $iterator = "0";
+            //            }
         }
         //        $keyArr = array_flip($keyArr);
         //        $keyArr = array_flip($keyArr);
