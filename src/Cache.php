@@ -143,7 +143,10 @@ class Cache
     private static function resolveConfigPath(): string
     {
         if (function_exists('root_path')) {
-            return root_path() . 'config/simple-cache.php';
+            $root_path = root_path();
+            // 判断目录末尾是否有斜杠，如果没有则补上
+            $root_path = rtrim($root_path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+            return $root_path . 'config' . DIRECTORY_SEPARATOR . 'simple-cache.php';
         }
         
         $vendorDir   = realpath(dirname(__DIR__));
