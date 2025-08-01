@@ -144,7 +144,7 @@ class Cache
     {
         if (function_exists('root_path')) {
             $root_path = root_path();
-            // 判断目录末尾是否有斜杠，如果没有则补上
+            // 保证目录结尾带有斜杠
             $root_path = rtrim($root_path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
             return $root_path . 'config' . DIRECTORY_SEPARATOR . 'simple-cache.php';
         }
@@ -192,16 +192,15 @@ class Cache
     /**
      * 模糊查找redis key
      *
+     * @param Redis  $redis
      * @param string $pattern 要匹配的规则  'test_*'
-     * @param int    $db      数据库号 默认0
      * @param int    $count   每次遍历数量 count越大总耗时越短，但单次阻塞越长。 建议5000-10000。并发不高则可以调至接近1w。
      * @param int    $timeout
      *
      * @return array
      */
-    public static function redisScan(string $pattern, int $db, int $count = 5000, int $timeout = 30): array
+    public static function redisScan(Redis $redis, string $pattern, int $count = 5000, int $timeout = 30): array
     {
-        $redis     = self::getInstance($db);
         $keyArr    = [];
         $startTime = time();
         
@@ -236,16 +235,15 @@ class Cache
     /**
      * 批量删除（pip管道模式）
      *
+     * @param Redis  $redis
      * @param string $key 支持模糊搜索[*] exp: test1_*
-     * @param int    $db  数据库编号
+     * @param int    $batchSize
      *
      * @return true
-     * @throws RedisException
      */
-    public static function delMutil(string $key, int $db, int $batchSize = 1000): bool
+    public static function delMutil(Redis $redis, string $key, int $batchSize = 1000): bool
     {
-        $redis = self::getInstance($db);
-        $keys  = self::redisScan($key, $db); // 模糊扫描查找
+        $keys = self::redisScan($redis, $key); // 模糊扫描查找
         
         if (count($keys) > 0) {
             $pipe = $redis->multi($redis::PIPELINE);  // 开启管道模式，代表将操作命令暂时放在管道里
