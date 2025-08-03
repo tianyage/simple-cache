@@ -257,4 +257,43 @@ class Cache
         }
         return true;
     }
+    
+    /**
+     * 返回实例信息
+     *
+     * @return array
+     */
+    public static function queryInstance(): array
+    {
+        $checkDb = [];
+        if (!empty(self::$instances)) {
+            foreach (self::$instances as $store_name => $store) {
+                foreach ($store as $dbindex => $instance) {
+                    $checkDb[$store_name][$dbindex] = self::getDbNum($instance);
+                }
+            }
+        }
+        return [
+            'date'          => date("Y-m-d H:i:s"),
+            'instances'     => self::$instances,
+            'configs'       => self::$configs,
+            'lastCheckTime' => self::$lastCheckTime,
+            'checkDb'       => $checkDb,
+        ];
+    }
+    
+    /**
+     * 获取当前连接的数据库编号
+     *
+     * @param Redis $redis
+     *
+     * @return string|null
+     */
+    public static function getDbNum(Redis $redis): ?string
+    {
+        // 获取当前连接的数据库编号（Redis 6.2及以上版本）
+        $clientInfo = $redis->client('INFO');
+        preg_match('/db=(\d+)/', $clientInfo, $matches);
+        return $matches[1] ?? null;
+    }
 }
